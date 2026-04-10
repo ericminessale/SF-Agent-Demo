@@ -15,29 +15,28 @@ Built with the [SignalWire AI Agents SDK](https://github.com/signalwire/signalwi
 
 Each agent has 3-5 tools. Each route is directly callable — point a phone number at `/sales` for a dedicated sales line, or use `/agent` as a general number with triage routing.
 
+**Every agent has knowledge search** — SOSL full-text search against Salesforce Knowledge articles. Callers can ask questions at any point in any department.
+
 ## What it does
+
+**Triage** (`/agent`):
+- Identify caller by name or phone
+- Route to the right department seamlessly (no transfer language)
+- Handle FAQ questions directly
 
 **Customer Service** (`/service`):
 - List and view order details, update shipping addresses, cancel with two-step confirmation
 - Create, view, and escalate support cases
 - Check support tier and entitlements
-- Search knowledge base (SOSL full-text search)
 
 **Sales** (`/sales`):
 - Create, list, select, update, and convert leads (with PGI guard against wrong company)
 - List, view, update stage, and add products to opportunities
-- Search knowledge base
 
 **Field Service** (`/field-service`):
 - Create and list work orders for on-site service
 - View deployed assets and equipment
 - Schedule events, create tasks, mark tasks complete
-- Search knowledge base
-
-**Triage** (`/agent`):
-- Identify caller by name or phone
-- Route to the right department seamlessly (no transfer language)
-- Handle FAQ questions directly via knowledge search
 
 ## Architecture
 
