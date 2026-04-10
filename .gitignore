@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+.claude/
+.mcp.json
+swml_dump.json
+post_prompt_log.json

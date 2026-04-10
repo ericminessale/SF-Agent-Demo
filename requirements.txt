@@ -1,0 +1,11 @@
+# Core SDK
+signalwire
+
+# Required: SDK does NOT auto-load .env files
+python-dotenv
+
+# Salesforce REST API client
+simple-salesforce
+
+# HTTP client (for OAuth token exchange)
+requests
