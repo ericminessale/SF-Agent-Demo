@@ -8,10 +8,10 @@ Built with the [SignalWire AI Agents SDK](https://github.com/signalwire/signalwi
 
 | Agent | Route | Purpose | Tools |
 |-------|-------|---------|-------|
-| **Triage** | `/agent` | Identifies caller, routes to department, handles FAQ | 3 |
-| **Customer Service** | `/service` | Orders, cases, support level, knowledge | 5 |
-| **Sales** | `/sales` | Leads, opportunities, knowledge | 4 |
-| **Field Service** | `/field-service` | Work orders, assets, scheduling, knowledge | 5 |
+| **Triage** | `/agent` | Identifies caller, routes to department | 3 |
+| **Customer Service** | `/service` | Orders, cases, support level | 5 |
+| **Sales** | `/sales` | Leads, opportunities | 4 |
+| **Field Service** | `/field-service` | Work orders, assets, scheduling | 5 |
 
 Each agent has 3-5 tools. Each route is directly callable — point a phone number at `/sales` for a dedicated sales line, or use `/agent` as a general number with triage routing.
 
