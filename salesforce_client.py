@@ -709,20 +709,22 @@ def add_campaign_member(sf: Salesforce, campaign_id: str,
 # ---------------------------------------------------------------------------
 
 def search_knowledge(sf: Salesforce, query: str) -> list:
-    """Search knowledge articles. Includes Draft articles for demo environments.
+    """Search knowledge articles using SOSL full-text search.
+    SOSL handles word order, partial matches, and relevance ranking.
     Returns empty list if Knowledge is not enabled."""
-    safe = escape_soql(query)
+    safe_query = escape_soql(query)
     try:
-        result = sf.query(
-            f"SELECT Id, Title, Summary, UrlName, ArticleNumber, PublishStatus "
-            f"FROM Knowledge__kav "
-            f"WHERE PublishStatus = 'Online' AND Language = 'en_US' "
-            f"AND (Title LIKE '%{safe}%' OR Summary LIKE '%{safe}%') "
-            f"LIMIT 5"
+        sosl = (
+            f"FIND {{{safe_query}}} IN ALL FIELDS "
+            f"RETURNING Knowledge__kav(Id, Title, Summary, UrlName, ArticleNumber, PublishStatus "
+            f"WHERE PublishStatus = 'Online' AND Language = 'en_US' LIMIT 5)"
         )
-        return result["records"]
+        result = sf.search(sosl)
+        if result and result.get("searchRecords"):
+            return result["searchRecords"]
     except Exception:
-        return []
+        pass
+    return []
 
 
 def get_knowledge_article(sf: Salesforce, article_id: str) -> dict | None:

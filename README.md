@@ -1,33 +1,53 @@
 # SF Agent Demo
 
-AI voice agent for comprehensive Salesforce CRM management, powered by SignalWire. One phone call handles orders, support cases, leads, opportunities, scheduling, knowledge base, field service, and entitlements — all against a live Salesforce org.
+Multi-agent voice AI system for Salesforce CRM, powered by SignalWire. Four specialized agents handle customer service, sales, field service, and triage — each on its own route, each independently callable, all sharing caller identity seamlessly across transfers.
 
 Built with the [SignalWire AI Agents SDK](https://github.com/signalwire/signalwire-python) using Programmatically Governed Inference (PGI): the AI proposes, code decides.
 
+## Agents
+
+| Agent | Route | Purpose | Tools |
+|-------|-------|---------|-------|
+| **Triage** | `/agent` | Identifies caller, routes to department, handles FAQ | 3 |
+| **Customer Service** | `/service` | Orders, cases, support level, knowledge | 5 |
+| **Sales** | `/sales` | Leads, opportunities, knowledge | 4 |
+| **Field Service** | `/field-service` | Work orders, assets, scheduling, knowledge | 5 |
+
+Each agent has 3-5 tools. Each route is directly callable — point a phone number at `/sales` for a dedicated sales line, or use `/agent` as a general number with triage routing.
+
 ## What it does
 
-9 consolidated tools handle 30+ operations across every major Salesforce domain:
+**Customer Service** (`/service`):
+- List and view order details, update shipping addresses, cancel with two-step confirmation
+- Create, view, and escalate support cases
+- Check support tier and entitlements
+- Search knowledge base (SOSL full-text search)
 
-| Tool | Actions | What it covers |
-|------|---------|---------------|
-| `identify_account` | lookup by name or phone | Caller identification with auto-detect via caller ID |
-| `orders` | list, details, update_address, cancel, confirm_cancel | Order management with two-step cancellation |
-| `cases` | list, details, create, escalate | Support ticket lifecycle |
-| `leads` | list, select, create, update, convert | Lead management through full sales pipeline |
-| `opportunities` | list, details, update_stage, add_product | Deal tracking and product attachment |
-| `scheduling` | list, create_task, schedule_event, complete_task | Tasks, events, and activity management |
-| `field_service` | list_work_orders, create_work_order, list_assets | On-site service and asset tracking |
-| `search_knowledge` | keyword search | FAQ lookup from published Knowledge articles |
-| `check_support_level` | entitlement check | Support tier and SLA verification |
+**Sales** (`/sales`):
+- Create, list, select, update, and convert leads (with PGI guard against wrong company)
+- List, view, update stage, and add products to opportunities
+- Search knowledge base
+
+**Field Service** (`/field-service`):
+- Create and list work orders for on-site service
+- View deployed assets and equipment
+- Schedule events, create tasks, mark tasks complete
+- Search knowledge base
+
+**Triage** (`/agent`):
+- Identify caller by name or phone
+- Route to the right department seamlessly (no transfer language)
+- Handle FAQ questions directly via knowledge search
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, but the key ideas:
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design. Key highlights:
 
-- **Consolidated tools** — 9 domain tools with an `action` parameter instead of 28 individual tools. The LLM picks the domain, code routes the action. This keeps tool selection reliable at scale.
-- **PGI governance** — Locked greeting step (can't access domain tools without identification), action-level precondition gating in code, two-step confirmation for destructive operations, prescriptive function returns.
-- **Voice-native** — Text normalization, ASR hints for Salesforce terminology, fillers on every tool, all values formatted for natural speech.
-- **Post-call logging** — Structured JSON summary written back to Salesforce as a Task after every call.
+- **Multi-agent on AgentServer** — 4 agents, one Python file, each at its own route
+- **Seamless transfers** — custom SWML transfer tool passes identity via URL query params. Receiving agent's `dynamic_config_callback` reads params and sets global_data before the AI starts. Zero re-identification.
+- **PGI governance** — locked greeting steps, action-level precondition gating, two-step cancel confirmation, prescriptive returns, PGI guard on lead company confusion
+- **SOSL knowledge search** — full-text search against Salesforce Knowledge articles, with per-agent parameter descriptions guiding the LLM to pass effective queries
+- **Post-call logging** — structured JSON summary written to Salesforce as a Task after every call
 
 ## Setup
 
@@ -60,38 +80,51 @@ python test_connection.py
 python seed_salesforce.py
 ```
 
-Creates 5 accounts, 7 contacts, 10 products, 15 orders, 8 cases, 12 leads, 12 opportunities, 10 events, 5 entitlements, 5 work orders, 9 assets, and 13 Knowledge articles.
+Creates accounts, contacts, products, orders, cases, leads, opportunities, events, entitlements, work orders, assets, and Knowledge articles.
 
-### 6. Run the agent
+### 6. Run the agents
 
 ```bash
 PYTHONUTF8=1 python agent.py
 ```
 
-The agent starts on port 3000 at `/agent`. Expose with ngrok or deploy, then point a SignalWire phone number at `https://your-url/agent`.
+All 4 agents start on port 3000:
+- `http://localhost:3000/agent` — Triage
+- `http://localhost:3000/service` — Customer Service
+- `http://localhost:3000/sales` — Sales
+- `http://localhost:3000/field-service` — Field Service
+
+Expose with ngrok, then point SignalWire phone numbers at the routes.
 
 ## Demo scenarios
 
-Try these when calling the agent:
+**General line** (call `/agent`):
+1. "Hi, this is Acme Corporation" — identifies account
+2. "I need to check on an order" — routes seamlessly to Customer Service
+3. "Actually, I also have a question about our support plan" — handled without re-identification
 
-1. **"Hi, this is Acme Corporation"** — auto-identifies the account, greets by name
-2. **"Show me our recent orders"** — lists orders with voice-formatted dates and amounts
-3. **"Cancel order 125"** — previews the order, asks for confirmation, creates a tracking case
-4. **"Do you have docs on API rate limits?"** — searches Knowledge articles, reads the answer
-5. **"Create a lead for Sarah Chen at BluePeak Software"** — creates a lead in Salesforce
-6. **"What support plan are we on?"** — checks entitlements and reads back the tier
-7. **"Schedule a follow-up call for tomorrow at 2 PM"** — creates an Event in Salesforce
-8. **"I need a technician dispatched for a failed server"** — creates a Work Order
+**Customer Service** (call `/service` directly):
+1. "Show me our recent orders" — lists with voice-formatted dates and amounts
+2. "Cancel order 125" — previews, confirms, creates tracking case
+3. "Do you have docs on password resets?" — searches Knowledge articles
 
-After hanging up, check Salesforce — there's a Task on the Account with a structured summary of the call.
+**Sales** (call `/sales` directly):
+1. "Create a lead for Sarah Chen at BluePeak Software" — creates in Salesforce
+2. "Show me our open opportunities" — lists deals with stages and amounts
+3. "What's the product compatibility info?" — searches Knowledge
+
+**Field Service** (call `/field-service` directly):
+1. "I need a technician dispatched for a failed server" — creates Work Order
+2. "What equipment do we have deployed?" — lists assets
+3. "Schedule a follow-up for next Wednesday" — creates Event
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `agent.py` | The voice AI agent — 9 consolidated tools, PGI-enforced |
-| `salesforce_client.py` | Salesforce REST API client (OAuth, SOQL, CRUD, voice formatting) |
+| `agent.py` | All 4 agents + shared utilities — AgentServer multi-route |
+| `salesforce_client.py` | Salesforce REST API client (OAuth, SOQL, SOSL, CRUD, voice formatting) |
 | `seed_salesforce.py` | Seeds the org with demo data across all domains |
 | `test_connection.py` | Verifies Salesforce API connectivity and object access |
-| `SETUP_GUIDE.md` | Step-by-step Salesforce org setup (30-40 min) |
-| `ARCHITECTURE.md` | Design decisions, PGI patterns, tool architecture |
+| `SETUP_GUIDE.md` | Step-by-step Salesforce org setup (45 min) |
+| `ARCHITECTURE.md` | Multi-agent design, PGI patterns, transfer mechanics |
