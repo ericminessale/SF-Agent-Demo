@@ -24,9 +24,8 @@ from urllib.parse import quote_plus
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
-from signalwire_agents import AgentBase
-from signalwire import AgentServer
-from signalwire_agents.core.function_result import SwaigFunctionResult as FunctionResult
+from signalwire import AgentBase, AgentServer
+from signalwire.core.function_result import FunctionResult
 
 import salesforce_client as sfc
 
@@ -57,16 +56,18 @@ def _gd(raw_data):
 def shared_per_call_config(query_params, body_params, headers, agent):
     """Shared dynamic config: auto-identify caller from transfer params or phone.
 
+    Returns (is_transfer, caller_request) so the agent can rebuild contexts.
+
     Three cases:
-    1. Transfer (query params with account_id): identified=True, skip greeting ID step
-    2. Auto-detect from phone (direct call, phone matches): identified=False,
-       auto_detected_name set — greeting confirms "Is this X?" then calls identify_account
-    3. No match (direct call, no phone match): identified=False — greeting asks for name
+    1. Transfer (query params with account_id): identified=True, skip greeting
+    2. Auto-detect from phone (direct call, phone matches): hint only
+    3. No match (direct call, no phone match): standard greeting
     """
 
     # Case 1: Transfer — identity already confirmed by the sending agent
     transferred_account_id = query_params.get("account_id", "")
     transferred_account_name = query_params.get("account_name", "")
+    caller_request = query_params.get("caller_request", "")
 
     if transferred_account_id and transferred_account_name:
         gd = {
@@ -81,16 +82,29 @@ def shared_per_call_config(query_params, body_params, headers, agent):
                 gd["support_tier"] = tier
         except Exception:
             pass
+        if caller_request:
+            gd["caller_request"] = caller_request
         agent.set_global_data(gd)
-        agent.prompt_add_section("Caller Info",
-            body=f"The caller is {transferred_account_name}. "
-                 f"Greet them by name (say '{transferred_account_name}'). "
-                 f"Do NOT ask who they are — you already know."
-        )
-        return
+
+        # Prompt section for the receiving agent
+        if caller_request:
+            agent.prompt_add_section("Caller Info", body=(
+                f"The caller is {transferred_account_name}. "
+                f"You are mid-conversation. Do NOT greet or introduce yourself. "
+                f"The caller already said: \"{caller_request}\". "
+                f"Call the appropriate tool immediately and read back the results. "
+                f"Do NOT ask 'would you like me to...' or 'shall I...' — just do it. "
+                f"Your very first words must be the data they asked for."
+            ))
+        else:
+            agent.prompt_add_section("Caller Info", body=(
+                f"The caller is {transferred_account_name}. "
+                f"Greet them by name (say '{transferred_account_name}'). "
+                f"Do NOT ask who they are — you already know."
+            ))
+        return True, caller_request
 
     # Case 2: Direct call — try to auto-detect from phone number
-    # Do NOT set identified=True — the greeting step still confirms
     from_header = headers.get("x-swml-from", "")
     if from_header:
         caller_id = sfc.normalize_phone(from_header)
@@ -99,7 +113,6 @@ def shared_per_call_config(query_params, body_params, headers, agent):
                 account = sfc.lookup_account_by_phone(sf(), caller_id)
                 if account:
                     name = account.get("Name", "")
-                    # Store as auto-detected hint, NOT as confirmed identity
                     agent.set_global_data({
                         "auto_detected_name": name,
                         "auto_detected_account_id": account["Id"],
@@ -111,6 +124,8 @@ def shared_per_call_config(query_params, body_params, headers, agent):
                     )
             except Exception:
                 pass  # Fail silently — Case 3 applies
+
+    return False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -155,9 +170,8 @@ def shared_on_summary(summary, raw_data, agent_name):
 # Shared: build transfer URL with identity params
 # ---------------------------------------------------------------------------
 
-def build_transfer_url(agent_instance, route, global_data):
-    """Build a transfer URL with account identity in query params."""
-    # get_full_url returns the server root (without agent's own route)
+def build_transfer_url(agent_instance, route, global_data, caller_request=""):
+    """Build a transfer URL with account identity and caller request in query params."""
     base = agent_instance.get_full_url(include_auth=True).rstrip("/")
     account_id = global_data.get("account_id", "")
     account_name = global_data.get("account_name", "")
@@ -165,6 +179,8 @@ def build_transfer_url(agent_instance, route, global_data):
     url = f"{base}{route}"
     if account_id:
         url += f"?account_id={quote_plus(account_id)}&account_name={quote_plus(account_name)}"
+        if caller_request:
+            url += f"&caller_request={quote_plus(caller_request)}"
     return url
 
 
@@ -244,7 +260,11 @@ class TriageAgent(AgentBase):
         self._build_contexts()
 
     def _per_call_config(self, query_params, body_params, headers, agent):
-        shared_per_call_config(query_params, body_params, headers, agent)
+        is_transfer, caller_request = shared_per_call_config(query_params, body_params, headers, agent)
+        if is_transfer:
+            ctx = agent.define_contexts()._contexts.get("default")
+            if ctx:
+                ctx.set_initial_step("route_intent")
 
     def _build_contexts(self):
         contexts = self.define_contexts()
@@ -254,9 +274,8 @@ class TriageAgent(AgentBase):
         greeting.add_section("Task", "Greet the caller and identify them.")
         greeting.add_section("Process", (
             "- Always open with a warm hello or welcome FIRST\n"
-            "- If global_data.identified is true (transfer): greet by account name and ask how you can help\n"
             "- If global_data.auto_detected_name is set: say 'Hello, is this {auto_detected_name}?' and wait for confirmation\n"
-            "- If neither: ask for their company name or phone number\n"
+            "- Otherwise: ask for their company name or phone number\n"
             "- When the caller confirms or provides a name, call identify_account immediately"
         ))
         greeting.set_step_criteria("Customer has been identified")
@@ -266,8 +285,9 @@ class TriageAgent(AgentBase):
         route = ctx.add_step("route_intent")
         route.add_section("Task", "Determine what the caller needs and route them.")
         route.add_section("Process", (
-            "- Ask 'How can I help you today?' and WAIT for their answer\n"
-            "- Once they state their need, call route_caller immediately\n"
+            "- If global_data.caller_request is set: call route_caller immediately with that request\n"
+            "- Otherwise ask 'How can I help you today?' and WAIT for their answer\n"
+            "- Once they state their need, call route_caller\n"
             "- For general how-to or product questions, use search_knowledge\n"
             "- NEVER mention departments, teams, or transfers\n"
             "- NEVER say 'transfer', 'connect you to', 'sales team', 'service team', or any team/department name\n"
@@ -369,11 +389,20 @@ class TriageAgent(AgentBase):
                     "onsite_and_equipment (work orders, technicians, on-site visits, assets, equipment, scheduling)"
                 ),
             },
+            "caller_request": {
+                "type": "string",
+                "description": (
+                    "A brief summary of what the caller asked for, in their own words. "
+                    "Example: 'check on order 125', 'cancel my last order', 'update on the Security Upgrade deal'. "
+                    "This is passed to the next agent so the caller does not have to repeat themselves."
+                ),
+            },
         },
         fillers=["Let me look into that for you...", "One moment..."],
     )
     def route_caller(self, args, raw_data):
         topic = (args.get("topic") or "").lower().strip()
+        caller_request = (args.get("caller_request") or "").strip()
         gd = _gd(raw_data)
 
         if not gd.get("account_id"):
@@ -396,7 +425,7 @@ class TriageAgent(AgentBase):
 
         # Build SWML transfer manually — without the ai_response set verb
         # that causes the "Transfer complete" text in RPC Chat sessions
-        url = build_transfer_url(self, route_map[topic], gd)
+        url = build_transfer_url(self, route_map[topic], gd, caller_request)
         spoken_phrases = {
             "orders_and_support": "Let me pull up your account information right now.",
             "deals_and_leads": "Let me check on that for you right now.",
@@ -541,7 +570,11 @@ class CustomerServiceAgent(AgentBase):
         self._build_contexts()
 
     def _per_call_config(self, query_params, body_params, headers, agent):
-        shared_per_call_config(query_params, body_params, headers, agent)
+        is_transfer, caller_request = shared_per_call_config(query_params, body_params, headers, agent)
+        if is_transfer:
+            ctx = agent.define_contexts()._contexts.get("default")
+            if ctx:
+                ctx.set_initial_step("route_intent")
 
     def _build_contexts(self):
         contexts = self.define_contexts()
@@ -551,14 +584,15 @@ class CustomerServiceAgent(AgentBase):
         greeting.add_section("Task", "Greet the caller and identify them.")
         greeting.add_section("Process", (
             "- Always open with a warm welcome FIRST\n"
-            "- If global_data.identified is true (transfer): greet by account name and ask how you can help\n"
-            "- If global_data.auto_detected_name is set: say 'Hello, is this {auto_detected_name}?' and wait for confirmation\n"
-            "- If neither: ask for their company name or phone number\n"
+            "- If global_data.auto_detected_name is set: say 'Hello, is this {auto_detected_name}?' and wait\n"
+            "- Otherwise: ask for their company name or phone number\n"
             "- When the caller confirms or provides info, call identify_account immediately"
         ))
         greeting.set_step_criteria("Customer has been identified")
         greeting.set_valid_steps([])
         greeting.set_functions(["identify_account"])
+
+        all_tools = ["identify_account", "orders", "cases", "check_support_level", "search_knowledge"]
 
         route = ctx.add_step("route_intent")
         route.add_section("Task", (
@@ -568,12 +602,9 @@ class CustomerServiceAgent(AgentBase):
             "Only ask for clarification if the request is genuinely ambiguous or missing required information. "
             "NEVER say you cannot access something."
         ))
-        route.set_step_criteria("A tool has been called and the caller's request has been resolved")
+        route.set_step_criteria("The caller stated a specific need AND a domain tool (orders, cases, check_support_level, or search_knowledge) returned results. Do NOT advance if only identify_account was called or if the caller only confirmed their identity.")
         route.set_valid_steps(["greeting"])
-        route.set_functions([
-            "identify_account", "orders", "cases",
-            "check_support_level", "search_knowledge",
-        ])
+        route.set_functions(all_tools)
 
         wrap = ctx.add_step("wrap_up")
         wrap.add_section("Task", (
@@ -581,9 +612,7 @@ class CustomerServiceAgent(AgentBase):
             "If yes, go back to route_intent. Otherwise, thank them and say goodbye."
         ))
         wrap.set_valid_steps(["route_intent"])
-        wrap.set_functions([
-            "orders", "cases", "check_support_level", "search_knowledge",
-        ])
+        wrap.set_functions(["orders", "cases", "check_support_level", "search_knowledge"])
 
     def on_summary(self, summary, raw_data=None):
         shared_on_summary(summary, raw_data, "customer-service")
@@ -1113,7 +1142,11 @@ class SalesAgent(AgentBase):
         self._build_contexts()
 
     def _per_call_config(self, query_params, body_params, headers, agent):
-        shared_per_call_config(query_params, body_params, headers, agent)
+        is_transfer, caller_request = shared_per_call_config(query_params, body_params, headers, agent)
+        if is_transfer:
+            ctx = agent.define_contexts()._contexts.get("default")
+            if ctx:
+                ctx.set_initial_step("route_intent")
 
     def _build_contexts(self):
         contexts = self.define_contexts()
@@ -1123,15 +1156,16 @@ class SalesAgent(AgentBase):
         greeting.add_section("Task", "Greet the caller and identify them.")
         greeting.add_section("Process", (
             "- Always open with a warm welcome FIRST\n"
-            "- If global_data.identified is true (transfer): greet by account name and ask how you can help\n"
-            "- If global_data.auto_detected_name is set: say 'Hello, is this {auto_detected_name}?' and wait for confirmation\n"
-            "- If neither: ask for their company name or phone number\n"
+            "- If global_data.auto_detected_name is set: say 'Hello, is this {auto_detected_name}?' and wait\n"
+            "- Otherwise: ask for their company name or phone number\n"
             "- Do NOT offer to help with leads or opportunities until the caller is identified\n"
             "- When the caller confirms or provides info, call identify_account immediately"
         ))
         greeting.set_step_criteria("Customer has been identified")
         greeting.set_valid_steps([])
         greeting.set_functions(["identify_account"])
+
+        all_tools = ["identify_account", "leads", "opportunities", "search_knowledge"]
 
         route = ctx.add_step("route_intent")
         route.add_section("Task", "Act on the caller's request using your tools.")
@@ -1146,9 +1180,9 @@ class SalesAgent(AgentBase):
             "- Only ask for clarification if the request is genuinely ambiguous or missing required info\n"
             "- NEVER say you cannot access something"
         ))
-        route.set_step_criteria("Caller's request has been handled")
+        route.set_step_criteria("The caller stated a specific need AND a domain tool (leads, opportunities, or search_knowledge) returned results. Do NOT advance if the caller only confirmed their identity.")
         route.set_valid_steps(["greeting"])
-        route.set_functions(["identify_account", "leads", "opportunities", "search_knowledge"])
+        route.set_functions(all_tools)
 
     def on_summary(self, summary, raw_data=None):
         shared_on_summary(summary, raw_data, "sales")
@@ -1586,7 +1620,11 @@ class FieldServiceAgent(AgentBase):
         self._build_contexts()
 
     def _per_call_config(self, query_params, body_params, headers, agent):
-        shared_per_call_config(query_params, body_params, headers, agent)
+        is_transfer, caller_request = shared_per_call_config(query_params, body_params, headers, agent)
+        if is_transfer:
+            ctx = agent.define_contexts()._contexts.get("default")
+            if ctx:
+                ctx.set_initial_step("route_intent")
 
     def _build_contexts(self):
         contexts = self.define_contexts()
@@ -1596,14 +1634,15 @@ class FieldServiceAgent(AgentBase):
         greeting.add_section("Task", "Greet the caller and identify them.")
         greeting.add_section("Process", (
             "- Always open with a warm hello or welcome FIRST\n"
-            "- If global_data.identified is true (transfer): greet by account name and ask how you can help\n"
-            "- If global_data.auto_detected_name is set: say 'Hello, is this {auto_detected_name}?' and wait for confirmation\n"
-            "- If neither: ask for their company name or phone number\n"
+            "- If global_data.auto_detected_name is set: say 'Hello, is this {auto_detected_name}?' and wait\n"
+            "- Otherwise: ask for their company name or phone number\n"
             "- When the caller confirms or provides info, call identify_account immediately"
         ))
         greeting.set_step_criteria("Customer has been identified")
         greeting.set_valid_steps([])
         greeting.set_functions(["identify_account"])
+
+        all_tools = ["identify_account", "work_orders", "assets", "scheduling", "search_knowledge"]
 
         route = ctx.add_step("route_intent")
         route.add_section("Task", "Act on the caller's request using your tools.")
@@ -1616,11 +1655,9 @@ class FieldServiceAgent(AgentBase):
             "- Only ask for clarification if the request is genuinely ambiguous or missing required info\n"
             "- NEVER say you cannot access something"
         ))
-        route.set_step_criteria("Caller's request has been handled")
+        route.set_step_criteria("The caller stated a specific need AND a domain tool (work_orders, assets, scheduling, or search_knowledge) returned results. Do NOT advance if the caller only confirmed their identity.")
         route.set_valid_steps(["greeting"])
-        route.set_functions([
-            "identify_account", "work_orders", "assets", "scheduling", "search_knowledge",
-        ])
+        route.set_functions(all_tools)
 
     def on_summary(self, summary, raw_data=None):
         shared_on_summary(summary, raw_data, "field-service")
