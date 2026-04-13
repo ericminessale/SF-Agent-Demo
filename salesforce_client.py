@@ -447,33 +447,6 @@ def update_lead_status(sf: Salesforce, lead_id: str, status: str) -> bool:
         return False
 
 
-def convert_lead(sf: Salesforce, lead_id: str) -> dict:
-    """Convert a lead to Account + Contact + Opportunity.
-    Returns {'success': bool, 'account_id': str, 'contact_id': str, 'opportunity_id': str, 'message': str}.
-    """
-    try:
-        resp = sf.restful(
-            "actions/standard/convertLead",
-            method="POST",
-            json={"inputs": [{"leadId": lead_id, "convertedStatus": "Closed - Converted"}]},
-        )
-        if resp and isinstance(resp, list) and resp[0].get("isSuccess"):
-            output = resp[0].get("outputValues", {})
-            return {
-                "success": True,
-                "account_id": output.get("accountId"),
-                "contact_id": output.get("contactId"),
-                "opportunity_id": output.get("opportunityId"),
-                "message": "Lead converted successfully.",
-            }
-        error_msg = str(resp[0].get("errors", "Unknown error")) if resp else "No response"
-        return {"success": False, "account_id": None, "contact_id": None,
-                "opportunity_id": None, "message": f"Conversion failed: {error_msg}"}
-    except Exception as e:
-        log.error(f"convert_lead error: {e}")
-        return {"success": False, "account_id": None, "contact_id": None,
-                "opportunity_id": None, "message": "Conversion failed due to a system error. Please try again or convert manually."}
-
 
 # ---------------------------------------------------------------------------
 # Opportunity queries
@@ -546,6 +519,12 @@ def add_opportunity_product(sf: Salesforce, opp_id: str, product_name: str,
     products = sf.query(
         f"SELECT Id, Name FROM Product2 WHERE Name LIKE '%{safe_name}%' AND IsActive = true LIMIT 1"
     )
+    # Retry with colon variant for voice input: "SLA Platinum" -> "SLA: Platinum"
+    if not products["records"] and " " in product_name:
+        colon_name = escape_soql(product_name.replace(" ", ": ", 1))
+        products = sf.query(
+            f"SELECT Id, Name FROM Product2 WHERE Name LIKE '%{colon_name}%' AND IsActive = true LIMIT 1"
+        )
     if not products["records"]:
         return {"success": False, "message": f"Product '{product_name}' not found in catalog."}
 
