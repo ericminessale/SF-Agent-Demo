@@ -49,6 +49,11 @@ def _gd(raw_data):
     return raw_data.get("global_data", {})
 
 
+def _report(result):
+    """Passthrough — kept for compatibility. No forced step transition."""
+    return result
+
+
 def _do_identify(args, raw_data):
     """Shared identify_account logic for all agents.
     Returns FunctionResult with account identity + pending_request in global_data."""
@@ -415,7 +420,6 @@ class TriageAgent(AgentBase):
 
         route = ctx.add_step("route_intent")
         route.add_section("Task", "Find out what the caller needs and use the appropriate tool.")
-        route.set_step_criteria("Conversation has ended")
         route.set_valid_steps([])
         route.set_functions(["identify_account", "route_caller", "search_knowledge"])
 
@@ -664,7 +668,6 @@ class CustomerServiceAgent(AgentBase):
 
         route = ctx.add_step("route_intent")
         route.add_section("Task", "Help the caller with their request using the available tools.")
-        route.set_step_criteria("Conversation has ended")
         route.set_valid_steps([])
         route.set_functions(all_tools)
 
@@ -726,13 +729,9 @@ class CustomerServiceAgent(AgentBase):
         elif action == "details":
             return self._get_order_details(args, raw_data)
         elif action == "update_address":
-            if not gd.get("selected_order_id"):
-                return FunctionResult("NO_ORDER: Call orders with action=details first.")
             return self._update_shipping_address(args, raw_data)
         elif action == "cancel":
-            if not gd.get("selected_order_id"):
-                return FunctionResult("NO_ORDER: Call orders with action=details first.")
-            return self._preview_cancel(raw_data)
+            return self._preview_cancel(args, raw_data)
         elif action == "confirm_cancel":
             if not gd.get("pending_cancel"):
                 return FunctionResult("NO_PREVIEW: Call orders with action=cancel first.")
@@ -757,11 +756,9 @@ class CustomerServiceAgent(AgentBase):
                 date = sfc.format_date_for_voice(o.get("EffectiveDate", ""))
                 lines.append(f"Order {num}: {status}, {amount}, placed {date}")
 
-            return FunctionResult(
-                f"Found {len(orders)} orders. Read each order to the caller: "
-                f"{'. '.join(lines)}. "
-                f"After reading them, ask if they need details on any specific order."
-            )
+            return _report(FunctionResult(
+                f"Found {len(orders)} orders: {'. '.join(lines)}."
+            ))
         except Exception as e:
             log.error(f"list_orders error: {e}")
             return FunctionResult("ERROR: Could not retrieve orders. Ask to try again.")
@@ -791,19 +788,18 @@ class CustomerServiceAgent(AgentBase):
 
             items_text = "; ".join(item_lines) if item_lines else "No line items"
             result = FunctionResult(
-                f"ORDER DETAILS for order {sfc.format_order_number(order.get('OrderNumber', ''))}:\n"
-                f"Status: {order.get('Status', 'Unknown')}. "
-                f"Total: {sfc.format_currency_for_voice(order.get('TotalAmount'))}. "
-                f"Date: {sfc.format_date_for_voice(order.get('EffectiveDate', ''))}.\n"
-                f"Shipping: {sfc.format_address(order.get('ShippingAddress'))}.\n"
-                f"Items: {items_text}.\n"
-                f"Read these details and ask if they need to make any changes."
+                f"Order {sfc.format_order_number(order.get('OrderNumber', ''))}: "
+                f"status {order.get('Status', 'Unknown')}, "
+                f"total {sfc.format_currency_for_voice(order.get('TotalAmount'))}, "
+                f"placed {sfc.format_date_for_voice(order.get('EffectiveDate', ''))}. "
+                f"Shipping to {sfc.format_address(order.get('ShippingAddress'))}. "
+                f"Items: {items_text}."
             )
             result.update_global_data({
                 "selected_order_id": order["Id"],
                 "selected_order_number": order.get("OrderNumber", ""),
             })
-            return result
+            return _report(result)
         except Exception as e:
             log.error(f"get_order_details error: {e}")
             return FunctionResult("ERROR: Could not retrieve order details.")
@@ -818,42 +814,78 @@ class CustomerServiceAgent(AgentBase):
         if not all([street, city, state, zip_code]):
             return FunctionResult("MISSING_INFO: Need street, city, state, ZIP. Ask for missing parts.")
 
+        # Resolve order: use selected_order_id if set, otherwise look up by order_number
+        order_id = gd.get("selected_order_id", "")
+        order_num = gd.get("selected_order_number", "")
+        if not order_id:
+            input_num = (args.get("order_number") or "").strip()
+            if not input_num:
+                return FunctionResult("MISSING_INFO: Which order? Ask the caller for the order number.")
+            try:
+                padded = str(int(input_num)).zfill(8)
+            except ValueError:
+                padded = input_num
+            order = sfc.get_order_by_number(sf(), padded)
+            if not order:
+                return FunctionResult(f"NOT_FOUND: Order {input_num} not found. Verify the number.")
+            order_id = order["Id"]
+            order_num = order.get("OrderNumber", input_num)
+
         try:
-            success = sfc.update_order_shipping(sf(), gd["selected_order_id"], street, city, state, zip_code)
+            success = sfc.update_order_shipping(sf(), order_id, street, city, state, zip_code)
             if success:
-                return FunctionResult(
+                return _report(FunctionResult(
                     f"Shipping address for order "
-                    f"{sfc.format_order_number(gd.get('selected_order_number', ''))} updated to "
+                    f"{sfc.format_order_number(order_num)} updated to "
                     f"{street}, {city}, {state} {zip_code}."
-                )
-            return FunctionResult("FAILED: Could not update. Only draft orders can be changed.")
+                ))
+            return _report(FunctionResult("FAILED: Could not update. Only draft orders can be changed."))
         except Exception as e:
             log.error(f"update_shipping error: {e}")
-            return FunctionResult("ERROR: Failed to update address.")
+            return _report(FunctionResult("ERROR: Failed to update address."))
 
-    def _preview_cancel(self, raw_data):
+    def _preview_cancel(self, args, raw_data):
         gd = _gd(raw_data)
+        # Resolve order: use selected_order_id if set, otherwise look up by order_number
+        order_id = gd.get("selected_order_id", "")
+        if not order_id:
+            input_num = (args.get("order_number") or "").strip()
+            if not input_num:
+                return FunctionResult("MISSING_INFO: Which order? Ask the caller for the order number.")
+            try:
+                padded = str(int(input_num)).zfill(8)
+            except ValueError:
+                padded = input_num
+            order_obj = sfc.get_order_by_number(sf(), padded)
+            if not order_obj:
+                return FunctionResult(f"NOT_FOUND: Order {input_num} not found. Verify the number.")
+            order_id = order_obj["Id"]
+
         try:
-            order = sf().Order.get(gd["selected_order_id"])
+            order = sf().Order.get(order_id)
             status = order.get("Status", "Unknown")
             order_num = sfc.format_order_number(order.get("OrderNumber", ""))
             total = sfc.format_currency_for_voice(order.get("TotalAmount"))
 
             if status != "Draft":
-                return FunctionResult(
+                return _report(FunctionResult(
                     f"CANNOT_CANCEL: Order {order_num} is '{status}', not draft. "
 "Suggest creating a support case instead."
-                )
+                ))
 
             result = FunctionResult(
                 f"PREVIEW: Order {order_num} is draft, total {total}. "
 "A tracking case will be created. Ask the caller to confirm."
             )
-            result.update_global_data({"pending_cancel": True})
-            return result
+            result.update_global_data({
+                "selected_order_id": order_id,
+                "selected_order_number": order.get("OrderNumber", ""),
+                "pending_cancel": True,
+            })
+            return _report(result)
         except Exception as e:
             log.error(f"preview_cancel error: {e}")
-            return FunctionResult("ERROR: Could not check cancellation.")
+            return _report(FunctionResult("ERROR: Could not check cancellation."))
 
     def _confirm_cancel(self, raw_data):
         gd = _gd(raw_data)
@@ -867,8 +899,8 @@ class CustomerServiceAgent(AgentBase):
                 result.update_global_data({
                     "selected_order_id": "", "selected_order_number": "", "pending_cancel": False,
                 })
-                return result
-            return FunctionResult(f"FAILED: {cancel_result['message']}")
+                return _report(result)
+            return _report(FunctionResult(f"FAILED: {cancel_result['message']}"))
         except Exception as e:
             log.error(f"confirm_cancel error: {e}")
             return FunctionResult("ERROR: Cancellation failed.")
@@ -908,9 +940,7 @@ class CustomerServiceAgent(AgentBase):
         elif action == "create":
             return self._create_case(args, raw_data)
         elif action == "escalate":
-            if not gd.get("selected_case_id"):
-                return FunctionResult("NO_CASE: Call cases with action=details first.")
-            return self._escalate_case(raw_data)
+            return self._escalate_case(args, raw_data)
 
         return FunctionResult("INVALID_ACTION: Valid actions: list, details, create, escalate.")
 
@@ -919,7 +949,7 @@ class CustomerServiceAgent(AgentBase):
         try:
             cases = sfc.get_cases_for_account(sf(), gd["account_id"])
             if not cases:
-                return FunctionResult("No open cases found for this account.")
+                return _report(FunctionResult("No open cases found for this account."))
 
             lines = []
             for c in cases:
@@ -929,13 +959,12 @@ class CustomerServiceAgent(AgentBase):
                 priority = c.get("Priority", "Normal")
                 lines.append(f"Case {num}: {subj} ({status}, {priority} priority)")
 
-            return FunctionResult(
-                f"Found {len(cases)} open cases. {'. '.join(lines)}. "
-                f"Read these to the caller and ask if they need details on any case."
-            )
+            return _report(FunctionResult(
+                f"Found {len(cases)} open cases: {'. '.join(lines)}."
+            ))
         except Exception as e:
             log.error(f"list_cases error: {e}")
-            return FunctionResult("ERROR: Could not retrieve cases.")
+            return _report(FunctionResult("ERROR: Could not retrieve cases."))
 
     def _get_case_details(self, args, raw_data):
         case_num = (args.get("case_number") or "").strip()
@@ -954,20 +983,19 @@ class CustomerServiceAgent(AgentBase):
 
             num = sfc.format_case_number(case.get("CaseNumber", ""))
             result = FunctionResult(
-                f"CASE DETAILS for case {num}:\n"
-                f"Subject: {case.get('Subject', 'N/A')}.\n"
-                f"Status: {case.get('Status', 'Unknown')}. Priority: {case.get('Priority', 'Normal')}.\n"
-                f"Description: {case.get('Description', 'No description')}.\n"
-                f"Read these details and ask if they want to escalate or need anything else."
+                f"Case {num}: subject '{case.get('Subject', 'N/A')}', "
+                f"status {case.get('Status', 'Unknown')}, "
+                f"priority {case.get('Priority', 'Normal')}. "
+                f"Description: {case.get('Description', 'No description')}."
             )
             result.update_global_data({
                 "selected_case_id": case["Id"],
                 "selected_case_number": case.get("CaseNumber", ""),
             })
-            return result
+            return _report(result)
         except Exception as e:
             log.error(f"get_case_details error: {e}")
-            return FunctionResult("ERROR: Could not retrieve case details.")
+            return _report(FunctionResult("ERROR: Could not retrieve case details."))
 
     def _create_case(self, args, raw_data):
         gd = _gd(raw_data)
@@ -981,28 +1009,44 @@ class CustomerServiceAgent(AgentBase):
         try:
             case_data = sfc.create_case(sf(), gd["account_id"], subject, description, priority)
             case_num = sfc.format_case_number(case_data["case_number"])
-            return FunctionResult(
+            return _report(FunctionResult(
                 f"CREATED: Case number {case_num}, {priority} priority. "
                 f"Tell the caller their case number is {case_num}."
-            )
+            ))
         except Exception as e:
             log.error(f"create_case error: {e}")
-            return FunctionResult("ERROR: Could not create case.")
+            return _report(FunctionResult("ERROR: Could not create case."))
 
-    def _escalate_case(self, raw_data):
+    def _escalate_case(self, args, raw_data):
         gd = _gd(raw_data)
+        # Resolve case: use selected_case_id if set, otherwise look up by case_number
+        case_id = gd.get("selected_case_id", "")
+        case_num_raw = gd.get("selected_case_number", "")
+        if not case_id:
+            input_num = (args.get("case_number") or "").strip()
+            if not input_num:
+                return FunctionResult("MISSING_INFO: Which case? Ask the caller for the case number.")
+            try:
+                padded = str(int(input_num)).zfill(8)
+            except ValueError:
+                padded = input_num
+            case_obj = sfc.get_case_by_number(sf(), padded)
+            if not case_obj:
+                return FunctionResult(f"NOT_FOUND: Case {input_num} not found. Verify the number.")
+            case_id = case_obj["Id"]
+            case_num_raw = case_obj.get("CaseNumber", input_num)
+
         try:
-            success = sfc.escalate_case(sf(), gd["selected_case_id"])
-            case_num = sfc.format_case_number(gd.get("selected_case_number", ""))
+            success = sfc.escalate_case(sf(), case_id)
+            case_num = sfc.format_case_number(case_num_raw)
             if success:
-                return FunctionResult(
-                    f"Case {case_num} escalated to high priority. "
-                    f"Confirm the escalation to the caller."
-                )
-            return FunctionResult(f"FAILED: Could not escalate case {case_num}.")
+                return _report(FunctionResult(
+                    f"Case {case_num} escalated to high priority."
+                ))
+            return _report(FunctionResult(f"FAILED: Could not escalate case {case_num}."))
         except Exception as e:
             log.error(f"escalate_case error: {e}")
-            return FunctionResult("ERROR: Failed to escalate.")
+            return _report(FunctionResult("ERROR: Failed to escalate."))
 
     @AgentBase.tool(
         name="check_support_level",
@@ -1030,10 +1074,10 @@ class CustomerServiceAgent(AgentBase):
             tier = ents[0].get("Type") or ents[0].get("Name", "Standard")
 
             result = FunctionResult(
-                f"Support entitlements: {'. '.join(lines)}. Current tier: {tier}. "
-                f"Read these details and ask if they have questions about their coverage."
+                f"Support tier: {tier}. Entitlements: {'. '.join(lines)}."
             )
             result.update_global_data({"support_tier": tier})
+            result.swml_change_step("report_findings")
             return result
         except Exception as e:
             log.error(f"check_entitlements error: {e}")
@@ -1059,13 +1103,13 @@ class CustomerServiceAgent(AgentBase):
         try:
             articles = sfc.search_knowledge(sf(), query)
             if not articles:
-                return FunctionResult(f"NO_RESULTS: No articles for '{query}'. Suggest creating a case.")
+                return _report(FunctionResult(f"NO_RESULTS: No articles for '{query}'. Suggest creating a case."))
 
             lines = [f"{a.get('Title', 'Untitled')}: {a.get('Summary', '')}" for a in articles]
-            return FunctionResult(f"Found {len(articles)} articles. {'. '.join(lines)}.")
+            return _report(FunctionResult(f"Found {len(articles)} articles. {'. '.join(lines)}."))
         except Exception as e:
             log.error(f"search_knowledge error: {e}")
-            return FunctionResult("UNAVAILABLE: Knowledge search not available.")
+            return _report(FunctionResult("UNAVAILABLE: Knowledge search not available."))
 
     @AgentBase.tool(
         name="route_to_sibling",
@@ -1230,7 +1274,6 @@ class SalesAgent(AgentBase):
 
         route = ctx.add_step("route_intent")
         route.add_section("Task", "Help the caller with their request using the available tools.")
-        route.set_step_criteria("Conversation has ended")
         route.set_valid_steps([])
         route.set_functions(all_tools)
 
@@ -1294,8 +1337,6 @@ class SalesAgent(AgentBase):
         elif action == "create":
             return self._create_lead(args, raw_data)
         elif action == "update":
-            if not gd.get("selected_lead_id"):
-                return FunctionResult("NO_LEAD: Call leads with action=select first.")
             return self._update_lead(args, raw_data)
         return FunctionResult("INVALID_ACTION: Valid actions: list, select, create, update.")
 
@@ -1385,8 +1426,28 @@ class SalesAgent(AgentBase):
     def _update_lead(self, args, raw_data):
         gd = _gd(raw_data)
         new_status = (args.get("new_status") or "").strip()
+
+        # Resolve lead: use selected_lead_id if set, otherwise look up by name
+        lead_id = gd.get("selected_lead_id", "")
+        if not lead_id:
+            name = (args.get("name") or "").strip()
+            if not name:
+                return FunctionResult("MISSING_INFO: Which lead? Ask the caller for the lead's name.")
+            leads = sfc.search_lead_by_name(sf(), name)
+            if not leads:
+                return FunctionResult(f"NOT_FOUND: No lead matching '{name}'.")
+            # If multiple with same company, pick first (same logic as _select_lead)
+            companies = set(l.get("Company", "") for l in leads)
+            if len(leads) > 1 and len(companies) > 1:
+                names = ", ".join(
+                    f"{l.get('FirstName', '')} {l.get('LastName', '')}".strip() + f" at {l.get('Company', '')}"
+                    for l in leads
+                )
+                return FunctionResult(f"MULTIPLE_MATCHES: Found {len(leads)}: {names}. Ask which one.")
+            lead_id = leads[0]["Id"]
+
         try:
-            success = sfc.update_lead_status(sf(), gd["selected_lead_id"], new_status)
+            success = sfc.update_lead_status(sf(), lead_id, new_status)
             if success:
                 return FunctionResult(f"Lead status changed to '{new_status}'.")
             return FunctionResult(
@@ -1426,12 +1487,8 @@ class SalesAgent(AgentBase):
         elif action == "details":
             return self._get_opportunity_details(args, raw_data)
         elif action == "update_stage":
-            if not gd.get("selected_opp_id"):
-                return FunctionResult("NO_OPPORTUNITY: Call opportunities with action=details first.")
             return self._update_opportunity_stage(args, raw_data)
         elif action == "add_product":
-            if not gd.get("selected_opp_id"):
-                return FunctionResult("NO_OPPORTUNITY: Call opportunities with action=details first.")
             return self._add_product(args, raw_data)
 
         return FunctionResult("INVALID_ACTION: Valid actions: list, details, update_stage, add_product.")
@@ -1491,11 +1548,30 @@ class SalesAgent(AgentBase):
             log.error(f"get_opp_details error: {e}")
             return FunctionResult("ERROR: Could not retrieve opportunity details.")
 
-    def _update_opportunity_stage(self, args, raw_data):
+    def _resolve_opp_id(self, args, raw_data):
+        """Resolve opportunity_id from selected_opp_id or by looking up opportunity_name.
+        Returns (opp_id, error_result). If error_result is not None, return it immediately."""
         gd = _gd(raw_data)
+        opp_id = gd.get("selected_opp_id", "")
+        if opp_id:
+            return opp_id, None
+        opp_name = (args.get("opportunity_name") or "").strip()
+        if not opp_name:
+            return None, FunctionResult("MISSING_INFO: Which deal? Ask the caller for the opportunity name.")
+        if not gd.get("account_id"):
+            return None, FunctionResult("NO_ACCOUNT: Customer not identified.")
+        opp = sfc.search_opportunity_by_name(sf(), opp_name, gd["account_id"])
+        if not opp:
+            return None, FunctionResult(f"NOT_FOUND: No opportunity matching '{opp_name}'.")
+        return opp["Id"], None
+
+    def _update_opportunity_stage(self, args, raw_data):
         new_stage = (args.get("new_stage") or "").strip()
+        opp_id, err = self._resolve_opp_id(args, raw_data)
+        if err:
+            return err
         try:
-            success = sfc.update_opportunity_stage(sf(), gd["selected_opp_id"], new_stage)
+            success = sfc.update_opportunity_stage(sf(), opp_id, new_stage)
             if success:
                 return FunctionResult(f"Stage changed to '{new_stage}'.")
             valid = ", ".join(sfc.VALID_STAGES)
@@ -1505,14 +1581,15 @@ class SalesAgent(AgentBase):
             return FunctionResult("ERROR: Could not update stage.")
 
     def _add_product(self, args, raw_data):
-        gd = _gd(raw_data)
         product_name = (args.get("product_name") or "").strip()
         quantity = args.get("quantity", 1) or 1
         if not product_name:
             return FunctionResult("MISSING_INFO: Ask which product to add.")
-
+        opp_id, err = self._resolve_opp_id(args, raw_data)
+        if err:
+            return err
         try:
-            result = sfc.add_opportunity_product(sf(), gd["selected_opp_id"], product_name, int(quantity))
+            result = sfc.add_opportunity_product(sf(), opp_id, product_name, int(quantity))
             if result["success"]:
                 return FunctionResult(f"ADDED: {result['message']}")
             return FunctionResult(f"FAILED: {result['message']}")
@@ -1705,7 +1782,6 @@ class FieldServiceAgent(AgentBase):
 
         route = ctx.add_step("route_intent")
         route.add_section("Task", "Help the caller with their request using the available tools.")
-        route.set_step_criteria("Conversation has ended")
         route.set_valid_steps([])
         route.set_functions(all_tools)
 
@@ -1839,8 +1915,8 @@ class FieldServiceAgent(AgentBase):
                 lines.append(f"{qty}x {display} ({status}{serial_text})")
 
             return FunctionResult(
-                f"Found {len(assets)} assets for {gd.get('account_name', 'this account')}. "
-                f"{'. '.join(lines)}. Ask if they need help with any."
+                f"Found {len(assets)} assets for {gd.get('account_name', 'this account')}: "
+                f"{'. '.join(lines)}."
             )
         except Exception as e:
             log.error(f"list_assets error: {e}")
